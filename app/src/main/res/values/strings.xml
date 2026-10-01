@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">GameBoost Pro</string>
+    <string name="accessibility_description">Mengizinkan GameBoost mendeteksi secara otomatis saat kamu membuka game untuk menerapkan optimasi.</string>
+</resources>

@@ -1,0 +1,980 @@
+package com.example.manager
+
+import android.annotation.SuppressLint
+import com.example.ui.stripEmoji
+import android.content.Context
+import android.util.Log
+import com.example.data.PreferenceManager
+import com.example.data.database.AppDatabase
+import com.example.data.database.LogEntity
+import com.example.data.database.ProfileEntity
+import com.example.data.repository.FsmState
+import com.example.manager.exec.ExecOutcome
+import com.example.manager.exec.ExecResult
+import com.example.service.GameBoostService
+import com.example.ui.FloatingPanelManager
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Gestión de sesiones de juego: FSM, boost lifecycle, detección de juegos,
+ * perfiles, y comandos privilegiados.
+ * 
+ * Ciclo de vida de una sesión:
+ *   INITIALIZING → READY → GAME_ACTIVE → READY (o DEGRADED → RECOVERING)
+ * 
+ * Uso:
+ *   val session = GameSessionManager(context, database, logDao, profileDao)
+ *   session.onExternalDeviceDetected = { /* toggle ff_mouse profile */ }
+ *   session.toggleBoost()
+ */
+class GameSessionManager(
+    private val context: Context,
+    private val database: AppDatabase,
+    private val touchOptimizer: TouchOptimizer,
+    private val ramManager: RamManager,
+    private val networkOptimizer: NetworkOptimizer,
+    private val systemTweaks: SystemTweaks,
+    private val powerOptimizer: PowerOptimizer,
+    private val isAutoDetectEnabled: () -> Boolean = { true },
+    private val hasExternalDevices: () -> Boolean = { false },
+    private val isMsaaEnabled: () -> Boolean = { false },
+    private val checkExternalDevicesNow: suspend () -> Boolean = { false }
+) {
+
+    companion object {
+        private const val TAG = "GameSession"
+        private const val HYSTERESIS_DELAY_MS = 5000L
+        private const val INIT_TIMEOUT_MS = 10_000L
+    }
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val profileDao = database.profileDao()
+    private val logDao = database.logDao()
+
+    // ─── FSM State ─────────────────────────────────────────────────
+    private val _fsmState = MutableStateFlow(FsmState.INITIALIZING)
+    val fsmState: StateFlow<FsmState> = _fsmState.asStateFlow()
+
+    // ─── Boost Active ──────────────────────────────────────────────
+    private val _isBoostActive = MutableStateFlow(false)
+    val isBoostActive: StateFlow<Boolean> = _isBoostActive.asStateFlow()
+
+    // ─── Shizuku Connected ─────────────────────────────────────────
+    private val _shizukuConnected = MutableStateFlow(false)
+    val shizukuConnected: StateFlow<Boolean> = _shizukuConnected.asStateFlow()
+
+    // ─── Simulated Game (foreground app) ───────────────────────────
+    private val _simulatedGame = MutableStateFlow<String?>(null)
+    val simulatedGame: StateFlow<String?> = _simulatedGame.asStateFlow()
+
+    // ─── Mobilador Active ──────────────────────────────────────────
+    private val _isMobiladorActive = MutableStateFlow(false)
+    val isMobiladorActive: StateFlow<Boolean> = _isMobiladorActive.asStateFlow()
+
+    // ─── ADS Pointer Active ────────────────────────────────────────
+    private val _adsPointerActive = MutableStateFlow(false)
+    val adsPointerActive: StateFlow<Boolean> = _adsPointerActive.asStateFlow()
+
+    // ─── Available Governors ───────────────────────────────────────
+    private val _availableGovernors = MutableStateFlow<List<String>>(emptyList())
+    val availableGovernors: StateFlow<List<String>> = _availableGovernors.asStateFlow()
+
+    // ─── Game Cache ────────────────────────────────────────────────
+    private val _gamesCache = ConcurrentHashMap<String, String>()
+
+    // ─── Hysteresis ────────────────────────────────────────────────
+    private val hysteresisJob = AtomicReference<Job?>(null)
+
+    // R1 (C3): Job diferido del "settle" del apply (markActive tras 8 s). Antes era
+    // fire-and-forget: si el boost se apagaba/restauraba antes de los 8 s, el Job
+    // huérfano revivía la sesión (RESTORED → ACTIVE zombie, forense 2026-09-13).
+    // Se retiene para cancelarlo en TODA salida: manual OFF, exit de juego y
+    // rollback por baseline fallido. Doble defensa: aunque sobreviva, la SSOT
+    // rechaza el ACTIVE ilegal (C4, markActiveIfApplying).
+    private var applySettleJob: Job? = null
+    private var manualOverrideActive = false
+    private var currentProfileId: String? = null
+
+    // Callbacks para comunicación hacia afuera
+    var onProfileApplied: ((ProfileManager.ProfileType) -> Unit)? = null
+
+    // F4: sesión persistente (captura baseline antes del primer apply; restore verificado)
+    private val boostSession: com.example.manager.boostsession.BoostSessionManager =
+        com.example.manager.boostsession.BoostSessionManager(
+            store = com.example.manager.boostsession.BoostSessionStore.create(context),
+            runCommand = { cmd -> ShizukuExecutor.runCommand(cmd) },
+            log = { level, tag, msg -> addLog(level, tag, msg) }
+        )
+
+    // Tweak performa nyata (Data Saver, Game Mode, am kill-all) — backup persisten di prefs
+    private val perfTweaks = PerformanceTweaks(context) { level, tag, msg -> addLog(level, tag, msg) }
+
+    // Para acceder al FloatingPanelManager desde el service
+    var floatingPanelManager: FloatingPanelManager? = null
+
+    // ─── Gaming DND ───────────────────────────────────────────────
+    @Volatile
+    private var originalZenMode: String? = null
+
+    // Flag de inicialización
+    private var isReady = false
+
+    // ─── Init ──────────────────────────────────────────────────────
+
+    suspend fun initialize(): Boolean {
+        if (isReady) return true
+
+        return try {
+            withTimeout(INIT_TIMEOUT_MS) {
+                // #5 SSOT (Q2): purge one-shot del override global legacy.
+                // Idempotente — barato de correr en cada arranque.
+                PreferenceManager.purgeLegacyGlobalManualProfile(context)
+                checkRealShizuku()
+                fetchAvailableGovernors()
+                // Sesi sebelumnya mati sebelum restore? Kembalikan Data Saver/Game Mode sekarang
+                // (hanya kalau tidak sedang boost).
+                if (!_isBoostActive.value && ShizukuExecutor.isReady()) perfTweaks.restoreIfDirty()
+                isReady = true
+                _fsmState.value = FsmState.READY
+                Log.d(TAG, "✅ GameSessionManager inicializado")
+                true
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "Init timed out, forcing READY")
+            _fsmState.value = FsmState.READY
+            isReady = true
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Init error: ${e.message}, forcing READY")
+            _fsmState.value = FsmState.READY
+            isReady = true
+            true
+        }
+    }
+
+    private fun checkRealShizuku() {
+        _shizukuConnected.value = ShizukuExecutor.isReady()
+    }
+
+    private suspend fun fetchAvailableGovernors() {
+        try {
+            val result = ShizukuExecutor.runCommand(
+                "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+            )
+            result.getOrNull()?.let {
+                _availableGovernors.value = it.split(" ").filter { gov -> gov.isNotBlank() }
+            }
+        } catch (_: Exception) {}
+    }
+
+    // ─── Calbacks de Shizuku (para reconexión en caliente) ────────
+
+    /**
+     * Notificación de binder de Shizuku disponible (OnBinderReceived).
+     * La invoca el listener global registrado en MainActivity — única capa con
+     * listeners del ciclo de vida de Shizuku. Refresca el flag cacheado desde el
+     * estado REAL (recheckShizuku) y reactiva la sesión pendiente con el mecanismo
+     * existente (onShizukuReconnected). Hallazgo #5 (shizuku-off-t1): sin esto, el
+     * flag queda stale tras reiniciar el server y el gate de simulateGameLaunch
+     * bloquea detecciones válidas hasta reiniciar la app.
+     */
+    fun onShizukuBinderReceived() {
+        recheckShizuku()
+        Log.d(TAG, "OnBinderReceived → recheck (shizuku=$_shizukuConnected) + hot-reload")
+        onShizukuReconnected()
+    }
+
+    fun onShizukuReconnected() {
+        val currentPkg = _simulatedGame.value
+        if (currentPkg != null && _fsmState.value != FsmState.GAME_ACTIVE) {
+            scope.launch {
+                simulateGameLaunchInternal(currentPkg)
+            }
+        }
+    }
+
+    fun toggleShizukuState() {
+        _shizukuConnected.value = ShizukuExecutor.isReady()
+    }
+
+    // ─── Boost Lifecycle ───────────────────────────────────────────
+
+    fun toggleBoost() {
+        val newState = !_isBoostActive.value
+        Log.d(TAG, "toggleBoost() called. Old state: ${_isBoostActive.value}, New state: $newState")
+        _isBoostActive.value = newState
+
+        PreferenceManager.setServiceRunning(context, _isBoostActive.value)
+        addLog("INFO", "Optimizer", "Boost mode: ${if (newState) "ON" else "OFF"}")
+
+        if (newState) {
+            Log.d(TAG, "Activating boost...")
+            // F4: capturar (o reutilizar) baseline y persistir APPLYING ANTES de que
+            // cualquier optimizer escriba en el sistema. Si el commit falla, no se
+            // aplica el boost: sin baseline persistido no hay recovery posible.
+            val sessionOk = kotlinx.coroutines.runBlocking { boostSession.beginApply() }
+            if (!sessionOk) {
+                applySettleJob?.cancel()
+                applySettleJob = null
+                addLog("ERROR", "Optimizer", "Gagal menyimpan baseline — boost DIBATALKAN")
+                _isBoostActive.value = false
+                PreferenceManager.setServiceRunning(context, false)
+                return
+            }
+            ensureBoostServiceRunning()
+            applyBoostSettings()
+            kotlinx.coroutines.runBlocking { } // (no-op: los writers corren en sus propios scopes; markActive abajo)
+            // Los optimizers lanzan sus writes en scopes propios; el estado pasa a
+            // ACTIVE tras el arranque del boost. Si el proceso muere entre medio,
+            // el estado persistido queda APPLYING → recovery al próximo arranque.
+            // R1 (C3): Job retenido y cancelable (antes: fire-and-forget, autor del
+            // zombie RESTORED→ACTIVE). El cuerpo usa markActiveIfApplying (C4): si
+            // llegara a ejecutarse tras un restore, la SSOT lo rechaza.
+            applySettleJob?.cancel()
+            applySettleJob = scope.launch {
+                delay(8000) // margen para que los writers asíncronos (5s/2s) completen
+                boostSession.markActiveIfApplying()
+            }
+        } else {
+            Log.d(TAG, "Deactivating boost...")
+            // R1 (C3): cancelar el settle pendiente ANTES de restaurar — sin esto,
+            // un markActive tardío reviviría la sesión (bug evidenciado).
+            applySettleJob?.cancel()
+            applySettleJob = null
+            restoreSettings()
+        }
+    }
+
+    private fun ensureBoostServiceRunning() {
+        try {
+            Log.d(TAG, "ensureBoostServiceRunning: Sending ACTION_START to GameBoostService")
+            val intent = android.content.Intent(context, GameBoostService::class.java).apply {
+                action = GameBoostService.ACTION_START
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        } catch (e: Exception) {
+            addLog("WARN", "Optimizer", "Gagal memulai GameBoostService: ${e.message}")
+        }
+    }
+
+    private fun applyBoostSettings() {
+        touchOptimizer.applyOptimization(sensitivity = 10, isGamingMode = true)
+        networkOptimizer.apply()
+        systemTweaks.apply()
+        // Data Saver + am kill-all (game + app ini di-whitelist dari Data Saver)
+        val gamePkg = _simulatedGame.value
+        scope.launch { perfTweaks.applyBoost(gamePkg) }
+
+        scope.launch {
+            delay(5000)
+            ramManager.clean(force = false)
+        }
+
+        scope.launch {
+            val animCommands = listOf(
+                "settings put global window_animation_scale 0",
+                "settings put global transition_animation_scale 0",
+                "settings put global animator_duration_scale 0"
+            )
+            executePrivilegedCommands(animCommands, tag = "BoostApplyAnim")
+        }
+
+        // NOTA: no limpiar logcat aquí (SystemTweaks.clearLogs) — no tiene función
+        // operacional en el apply y destruía el buffer de diagnóstico en cada boost.
+
+        // Gaming DND — silenciar notificaciones durante el juego
+        scope.launch {
+            val zenResult = ShizukuExecutor.runCommand("settings get global zen_mode")
+            if (zenResult.isSuccess) {
+                val mode = zenResult.getOrNull()?.trim()
+                if (!mode.isNullOrBlank() && mode != "null") {
+                    originalZenMode = mode
+                }
+            }
+            ShizukuExecutor.runCommand("settings put global zen_mode 2")
+            addLog("INFO", "GamingDND", "🔇 Jangan Ganggu diaktifkan (zen_mode=2)")
+        }
+    }
+
+    /**
+     * Backup RAM Mobilador (F4 por key).
+     * Cap.value == null → key ausente → settings delete.
+     * Cap outer null → read fail / muerte mid-ON → fallback AOSP documentado.
+     */
+    private data class SettingCap(val value: String?)
+
+    @Volatile private var mobiladorPointerCap: SettingCap? = null
+    @Volatile private var mobiladorLongPressCap: SettingCap? = null
+
+    private suspend fun captureSettingCap(ns: String, key: String): SettingCap? {
+        val result = ShizukuExecutor.runCommand("settings get $ns $key")
+        if (result.isFailure) return null
+        val raw = result.getOrNull()?.trim()
+        return SettingCap(if (raw.isNullOrBlank() || raw == "null") null else raw)
+    }
+
+    fun toggleMobilador() {
+        val newState = !_isMobiladorActive.value
+        _isMobiladorActive.value = newState
+        addLog("INFO", "Mobilador", "Mode Mobilador: ${if (newState) "DIAKTIFKAN" else "DINONAKTIFKAN"}")
+
+        if (newState) {
+            scope.launch {
+                if (mobiladorPointerCap == null) {
+                    mobiladorPointerCap = captureSettingCap("system", "pointer_speed")
+                }
+                if (mobiladorLongPressCap == null) {
+                    mobiladorLongPressCap = captureSettingCap("secure", "long_press_timeout")
+                }
+                executePrivilegedCommands(
+                    listOf(
+                        "settings put system pointer_speed 7",
+                        "settings put secure long_press_timeout 120"
+                    ),
+                    tag = "MobiladorOn"
+                )
+            }
+        } else {
+            scope.launch {
+                val fallbackKeys = mutableListOf<String>()
+                fun buildRestore(
+                    cap: SettingCap?,
+                    ns: String,
+                    key: String,
+                    fallback: String
+                ): String = when {
+                    cap == null -> {
+                        fallbackKeys.add("$ns/$key")
+                        "settings put $ns $key $fallback"
+                    }
+                    cap.value == null -> "settings delete $ns $key"
+                    else -> "settings put $ns $key ${cap.value}"
+                }
+                val commands = listOf(
+                    buildRestore(mobiladorPointerCap, "system", "pointer_speed", "0"),
+                    buildRestore(
+                        // 120 = default real del ZTE Z2352N (MyOS 13); AOSP doc dice 400
+                        // pero ese valor no existe en este device (medido 2026-09-12).
+                        mobiladorLongPressCap, "secure", "long_press_timeout", "120"
+                    )
+                )
+                val results = executePrivilegedCommands(commands, tag = "MobiladorOff")
+                val okCount = results.count { it.outcome is ExecOutcome.EXECUTED }
+                if (fallbackKeys.isNotEmpty()) {
+                    addLog(
+                        "WARN", "Mobilador",
+                        "Fallback AOSP (belum diukur di perangkat) pada: ${fallbackKeys.joinToString()} " +
+                            "— cap null karena gagal baca atau proses mati saat ON"
+                    )
+                }
+                if (okCount == commands.size) {
+                    addLog("INFO", "Mobilador", "Pengaturan dipulihkan ($okCount/${commands.size})")
+                    mobiladorPointerCap = null
+                    mobiladorLongPressCap = null
+                } else {
+                    addLog(
+                        "ERROR", "Mobilador",
+                        "Pemulihan sebagian ($okCount/${commands.size}) — cap dipertahankan untuk dicoba ulang"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * R1 (C6): punto ÚNICO de restauración del boost. Converge las dos secuencias
+     * que antes divergían (OFF manual vía restoreSettings y exit de juego vía
+     * triggerExitWithHysteresis): mismo orden, misma cobertura, un solo lugar que
+     * mantener. `reason` etiqueta los logs (diagnóstico).
+     *
+     * Orden (F4/#5): restoreVerified primero (SSOT, verificado por relectura),
+     * capa 2 de optimizers después, animaciones/power/DND al final.
+     * Los extras exclusivos de la salida de juego (thermalservice reset,
+     * disableGameMode, Mobilador, ram clean) quedan en el call-site de exit.
+     */
+    private fun performRestore(reason: String) {
+        scope.launch {
+            val report = boostSession.restoreVerified()
+            if (!report.allOk) {
+                addLog("ERROR", "Optimizer", "[$reason] Pemulihan terverifikasi dengan kegagalan (${report.results.values.count { it == com.example.manager.boostsession.RestoreResult.RESTORE_FAILED }}) — status menjadi RECOVERY_REQUIRED")
+            }
+        }
+        touchOptimizer.restore()
+        networkOptimizer.restore()
+        systemTweaks.restore()
+        scope.launch { perfTweaks.restore() }
+        scope.launch {
+            val commands = listOf(
+                "settings put global window_animation_scale 1",
+                "settings put global transition_animation_scale 1",
+                "settings put global animator_duration_scale 1",
+                "cmd power set-fixed-performance-mode-enabled false",
+                "cmd power set-adaptive-power-saver-enabled true"
+            )
+            executePrivilegedCommands(commands, tag = "SettingsRestore")
+        }
+
+        // Restaurar modo No Molestar
+        scope.launch {
+            val restoreCmd = if (!originalZenMode.isNullOrBlank()) {
+                "settings put global zen_mode $originalZenMode"
+            } else {
+                "settings put global zen_mode 0"
+            }
+            ShizukuExecutor.runCommand(restoreCmd)
+            originalZenMode = null
+            addLog("INFO", "GamingDND", "🔔 Jangan Ganggu dipulihkan")
+        }
+    }
+
+    /** OFF manual del boost (switch). R1 (C6): delega en la restauración convergida. */
+    private fun restoreSettings() {
+        performRestore("manual-off")
+    }
+
+    // ─── Game Detection ───────────────────────────────────────────
+
+    suspend fun simulateGameLaunch(packageName: String?) {
+        if (packageName == null) {
+            triggerExitWithHysteresis()
+            return
+        }
+        simulateGameLaunchInternal(packageName)
+    }
+
+    private suspend fun simulateGameLaunchInternal(packageName: String) {
+        if (!isAutoDetectEnabled()) return
+
+        addLog("DEBUG", "FSM_DIAG", "simulateGameLaunch($packageName) | fsmState=${_fsmState.value}")
+
+        hysteresisJob.getAndSet(null)?.cancel()
+
+        if (_simulatedGame.value != null && _simulatedGame.value != packageName) {
+            manualOverrideActive = false
+        }
+
+        if (_simulatedGame.value == packageName && _fsmState.value == FsmState.GAME_ACTIVE) {
+            return
+        }
+
+        val isMapper = packageName.contains("gg.mouse") ||
+                packageName.contains("vphone") ||
+                packageName.contains("scrcpy") ||
+                packageName.contains("flydigi") ||
+                packageName.contains("gamesir") ||
+                packageName.contains("mantis") ||
+                packageName.contains("panda") ||
+                packageName.contains("gamewolf")
+
+        val gameName = _gamesCache[packageName]
+        val knownTencentGames = setOf(
+            "com.tencent.ig", "com.tencent.tmgp.pubgm", "com.tencent.tmgp.sgame",
+            "com.pubg.krmobile", "com.rekoo.pubgm"
+        )
+        val isPotentialGame = packageName.contains("freefire") ||
+                knownTencentGames.any { packageName.startsWith(it) } ||
+                packageName.contains("garena")
+
+        val isGame = isMapper || gameName != null || isPotentialGame
+
+        if (isGame) {
+            val name = gameName ?: if (isMapper) "Mapper" else "Potential Game"
+            addLog("INFO", "Monitor", "Game detected: $name ($packageName)")
+
+            // Consultar el estado VIVO del binder, no la caché: _shizukuConnected puede
+            // quedar stale-true si el server muere sin boost activo (nadie lo refresca
+            // hasta el próximo evento). Hallazgo espejo de shizuku-off-t1.
+            if (!ShizukuExecutor.isReady()) {
+                addLog("WARN", "Monitor", "$name terdeteksi tetapi Shizuku TIDAK terhubung")
+                _simulatedGame.value = packageName
+                return
+            }
+
+            _simulatedGame.value = packageName
+            _fsmState.value = FsmState.GAME_ACTIVE
+
+            applyHighPriorityOptimizations(packageName)
+
+            scope.launch {
+                delay(3000)
+                powerOptimizer.suspendCachedApps(packageName)
+            }
+
+            // ─── FASE 2 y 3: Perfil según dispositivos externos ───
+            // Forzar chequeo on-demand de dispositivos externos (no esperar ciclo de 5s)
+            val externalConnected = if (isMapper) true else checkExternalDevicesNow()
+            
+            addLog("INFO", "Monitor", "Profil: mapper=$isMapper, ext=$externalConnected, boostAktif=${_isBoostActive.value}")
+
+            // ¿Hay un perfil manual recordado (persistido) para este juego, o una
+            // preferencia manual en memoria? Si sí, reaplicarlo y NO pisarlo con la
+            // auto-detección.
+            // #5 SSOT (Q1): la preferencia manual es POR JUEGO. El fallback global
+            // (key con pkg vacío) era el vector de envenenamiento persistente: pisaba
+            // perfiles auto de CUALQUIER juego y se re-armaba a sí mismo.
+            val rememberedManual = if (packageName.isNotBlank()) {
+                PreferenceManager.getLastManualProfile(context, packageName)
+            } else {
+                null
+            }
+            if (rememberedManual != null || manualOverrideActive) {
+                val profileToApply = rememberedManual ?: currentProfileId ?: "extreme"
+                addLog("INFO", "Monitor", "▶️ Menerapkan ulang profil manual yang diingat: $profileToApply")
+                setActiveProfile(profileToApply, isManual = true)
+                if (!_isBoostActive.value) {
+                    delay(500)
+                    toggleBoost()
+                }
+            } else if (isMapper || externalConnected) {
+                // Dispositivo externo o mapper → FF MOUSE DUO siempre
+                addLog("INFO", "Monitor", "▶️ Menerapkan profil FF Mouse Duo")
+                setActiveProfile("ff_mouse", isManual = false)
+                if (!_isBoostActive.value) {
+                    delay(500)
+                    toggleBoost()
+                }
+            } else {
+                // Juego táctil sin dispositivos externos
+                val isFreeFire = packageName.contains("freefire") ||
+                        packageName.contains("garena") ||
+                        _gamesCache[packageName]?.lowercase()?.contains("free fire") == true
+
+                if (isFreeFire) {
+                    // Free Fire táctil → perfil FREE FIRE TOUCH
+                    addLog("INFO", "Monitor", "▶️ Free Fire layar sentuh terdeteksi. Menerapkan profil FREE FIRE TOUCH")
+                    setActiveProfile("free_fire_touch", isManual = false)
+                }
+
+                if (!_isBoostActive.value) {
+                    delay(500)
+                    toggleBoost()
+                }
+            }
+        } else {
+            triggerExitWithHysteresis()
+        }
+    }
+
+    private suspend fun applyHighPriorityOptimizations(packageName: String) {
+        // FASE 0: Game Mode API (Android 12+)
+        enableGameMode(packageName)
+
+        // Adaptive Power Saver Off
+        executePrivilegedCommands(
+            listOf("cmd power set-adaptive-power-saver-enabled false"),
+            tag = "AdaptivePowerSaver_Off"
+        )
+
+        // FASE 1: Governor + Performance Mode
+        val phase1Commands = listOf(
+            "cmd power set-fixed-performance-mode-enabled true"
+        )
+        executePrivilegedCommands(phase1Commands, tag = "HighPriority_Phase1")
+
+        // FASE 2: Refresh rate (delay 500ms)
+        delay(500)
+        executePrivilegedCommands(
+            listOf(
+                "settings put system peak_refresh_rate 120.0",
+                "settings put system min_refresh_rate 90.0"
+            ),
+            tag = "HighPriority_Phase2"
+        )
+
+
+    }
+
+    /** Game Mode PERFORMANCE nyata via `cmd game` (Android 12+); dipulihkan lewat reset. */
+    private fun enableGameMode(packageName: String) {
+        scope.launch { perfTweaks.setGameMode(packageName, true) }
+    }
+
+    private fun disableGameMode(packageName: String) {
+        scope.launch { perfTweaks.setGameMode(packageName, false) }
+    }
+
+    // ─── Exit with Hysteresis ─────────────────────────────────────
+
+    private fun triggerExitWithHysteresis() {
+        // R1 (C3): confirmación de salida → cancelar el settle del apply PRIMERO.
+        // Un markActive tardío no debe sobrevivir al restore (zombie C4-evidenciado).
+        applySettleJob?.cancel()
+        applySettleJob = null
+        hysteresisJob.set(scope.launch {
+            try {
+                delay(HYSTERESIS_DELAY_MS)
+                val oldGame = _simulatedGame.value
+
+                if (oldGame != null || _fsmState.value == FsmState.GAME_ACTIVE) {
+                    _simulatedGame.value = null
+                    _fsmState.value = FsmState.READY
+
+                    // SIEMPRE apagar boost / power mode real al salir del juego,
+                    // tenga o no un perfil manual activo.
+                    addLog("INFO", "Monitor", "Keluar dari game terkonfirmasi ($oldGame)")
+                    // F4: restore verificado del baseline persistido (reemplaza la
+                    // dependencia de backups RAM para las 43 keys auditadas).
+                    // R1 (C6): restauración convergida; extras exclusivos del exit:
+                    if (oldGame != null) disableGameMode(oldGame)
+                    executePrivilegedCommands(
+                        listOf("cmd thermalservice reset"),
+                        tag = "RestoreThermal"
+                    )
+                    performRestore("game-exit")
+                    if (_isMobiladorActive.value) toggleMobilador()
+                    ramManager.clean()
+
+                    // A. Sincronizar estado en-app: apagar boost para que el overlay
+                    // (proyección R1-C5) se oculte y la notificación pase a estado neutral.
+                    // El apagado real de power mode corre dentro de performRestore.
+                    if (_isBoostActive.value) {
+                        _isBoostActive.value = false
+                        PreferenceManager.setServiceRunning(context, false)
+                        addLog("INFO", "Monitor", "Boost dalam aplikasi dimatikan (overlay disembunyikan)")
+                    }
+
+                    // Recordar el perfil manual elegido para reaplicarlo la próxima vez
+                    // que se abra este juego (persistencia, no el boost prendido como
+                    // mecanismo de "memoria").
+                    if (manualOverrideActive) {
+                        val pkg = oldGame
+                        val profId = currentProfileId
+                        if (pkg != null && profId != null) {
+                            PreferenceManager.setLastManualProfile(context, pkg, profId)
+                            addLog("INFO", "Monitor", "Profil manual '$profId' diingat untuk $pkg")
+                        }
+                        currentProfileId = null
+                    }
+
+                    // B1. Notificación neutral ("Optimizer Service Running") vía el boost
+                    // observer cuando isBoostActive=false. No aplicamos ningún perfil al
+                    // salir: el perfil recordado persiste en SharedPreferences para
+                    // reaplicarse solo al reabrir el juego.
+
+                    manualOverrideActive = false
+                }
+            } catch (e: CancellationException) {
+                throw e
+            }
+        })
+    }
+
+    // ─── Profile Management ───────────────────────────────────────
+
+    fun setActiveProfile(id: String, isManual: Boolean = true) {
+        if (isManual) {
+            hysteresisJob.getAndSet(null)?.cancel()
+            manualOverrideActive = true
+            currentProfileId = id
+            // Recordar el perfil manual para el juego actual si hay uno activo;
+            // si no, guardarlo como preferencia global para reaplicar al próximo juego.
+            // #5 SSOT (Q1): nunca persistir override global (pkg vacío) — la
+            // preferencia manual vive solo por juego; sin juego activo no se persiste.
+            val pkg = _simulatedGame.value
+            if (!pkg.isNullOrBlank()) {
+                PreferenceManager.setLastManualProfile(context, pkg, id)
+            }
+        }
+
+        scope.launch {
+            profileDao.setActiveProfile(id)
+            val profileEntity = profileDao.getProfileById(id)
+
+            val profileType = when (profileEntity?.id) {
+                "extreme" -> ProfileManager.ProfileType.EXTREME
+                "balanced" -> ProfileManager.ProfileType.BALANCED
+                "battery_saver" -> ProfileManager.ProfileType.POWER_SAVE
+                "ff_mouse" -> ProfileManager.ProfileType.ADS
+                "free_fire_touch" -> ProfileManager.ProfileType.FREE_FIRE_TOUCH
+                else -> ProfileManager.ProfileType.entries.find {
+                    it.name.equals(profileEntity?.name, true) ||
+                            profileEntity?.name?.contains(it.name, ignoreCase = true) == true
+                }
+            }
+
+            if (profileType != null) {
+                ProfileManager.applyProfile(profileType)
+                // Aplicar optimizaciones de red (DNS, WiFi low-latency, BT coex)
+                networkOptimizer.apply()
+                onProfileApplied?.invoke(profileType)
+            }
+        }
+    }
+
+    // ─── External device detection callback ────────────────────────
+
+    /**
+     * Llamado por SystemMonitor cuando se detecta un dispositivo externo
+     * durante una sesión de juego activa.
+     */
+    fun onExternalDeviceDetectedWhileGaming(isConnected: Boolean) {
+        if (isConnected && _fsmState.value == FsmState.GAME_ACTIVE) {
+            addLog("INFO", "Monitor", "Perangkat eksternal terdeteksi saat berjalan. Menerapkan profil FF Mouse Duo.")
+            if (!manualOverrideActive) {
+                setActiveProfile("ff_mouse", isManual = false)
+            }
+        }
+    }
+
+    // ─── Quick Clean ──────────────────────────────────────────────
+
+    fun quickClean() {
+        ramManager.clean(force = true)
+        systemTweaks.clearLogs()
+    }
+
+    // ─── FSM State setter ─────────────────────────────────────────
+
+    fun setFsmState(state: FsmState) {
+        _fsmState.value = state
+        addLog("DEBUG", "FSM", "State changed to: $state")
+    }
+
+    // ─── Toggle Shizuku ───────────────────────────────────────────
+
+    fun recheckShizuku() {
+        _shizukuConnected.value = ShizukuExecutor.isReady()
+    }
+
+    // ─── Games Cache ──────────────────────────────────────────────
+
+    fun getGameName(packageName: String): String? = _gamesCache[packageName]
+
+    fun addGameToCache(packageName: String, displayName: String) {
+        _gamesCache[packageName] = displayName
+    }
+
+    fun removeGameFromCache(packageName: String) {
+        _gamesCache.remove(packageName)
+    }
+
+    fun clearGamesCache() {
+        _gamesCache.clear()
+    }
+
+    // ─── SetForegroundApp (desde AccessibilityService o GameDetector) ─
+
+    fun setForegroundApp(packageName: String) {
+        scope.launch {
+            simulateGameLaunch(packageName)
+        }
+    }
+
+    /**
+     * Señal de que el usuario salió de la app en foreground
+     * (no se pudo detectar ninguna app activa).
+     */
+    fun onForegroundAppLost() {
+        scope.launch {
+            simulateGameLaunch(null)
+        }
+    }
+
+    // ─── Compartir estado para acceso externo ─────────────────────
+
+    fun getSimulatedGame(): String? = _simulatedGame.value
+
+    // ─── Comandos Privilegiados ───────────────────────────────────
+
+    /**
+     * Ejecuta una lista de comandos privilegiados y devuelve un resultado estructurado
+     * por cada uno. F1-CP1: reemplaza el fire-and-forget Unit por [ExecResult].
+     *
+     * Regla: exit 0 != "aplicado". El resultado distingue [ExecOutcome.EXECUTED]
+     * (corrió pero sin verificación) de verificación real (read-back, CP4).
+     */
+    suspend fun executePrivilegedCommands(
+        commands: List<String>,
+        tag: String = "Exec"
+    ): List<ExecResult> {
+        val results = mutableListOf<ExecResult>()
+
+        for (cmd in commands) {
+            // Skip governor commands if kernel blocks writes (ZTE, Xiaomi, etc.)
+            if (cmd.contains("scaling_governor") && !isGovernorWritable()) {
+                addLog("DEBUG", tag, "Governor diblokir kernel — dilewati")
+                results += ExecResult(
+                    outcome = ExecOutcome.EXECUTED("skipped-governor"),
+                    command = cmd
+                )
+                continue
+            }
+
+            val res = ShizukuExecutor.runCommand(cmd)
+            if (res.isSuccess) {
+                // #5 SSOT: grabar el valor aplicado en la sesión persistida. Solo
+                // settings put/delete — otros comandos (cmd power, for/dir) no afectan
+                // el baseline (recordAppliedCommand los ignora). El restore reconoce
+                // así "aplicado por nosotros" sin depender de la tabla estática.
+                boostSession.recordAppliedCommand(cmd)
+                results += ExecResult(
+                    outcome = ExecOutcome.EXECUTED(res.getOrNull()?.trim() ?: ""),
+                    command = cmd
+                )
+            } else {
+                // Intentar fallback vía Settings API in-process (solo para "settings put")
+                val fallbackOutcome = trySettingsApiOutcome(cmd)
+                if (fallbackOutcome != null) {
+                    // #5 SSOT: el fallback in-process TAMBIÉN aplicó el valor → grabarlo
+                    boostSession.recordAppliedCommand(cmd)
+                    results += ExecResult(outcome = fallbackOutcome, command = cmd)
+                } else {
+                    // No se pudo ejecutar el comando
+                    val errMsg = res.exceptionOrNull()?.message
+                    val outcome = if (ShizukuExecutor.isReady().not()) {
+                        ExecOutcome.PRIVILEGE_UNAVAILABLE(errMsg)
+                    } else {
+                        ExecOutcome.EXIT_NONZERO(
+                            exit = -1,
+                            stderr = errMsg
+                        )
+                    }
+                    results += ExecResult(outcome = outcome, command = cmd)
+                    val friendlyMsg = when {
+                        cmd.contains("scaling_governor") -> "Governor tidak bisa ditulis (diblokir SELinux/Kernel)"
+                        cmd.contains("renice") || cmd.contains("taskset") -> "Izin tidak cukup untuk $cmd"
+                        else -> "Gagal: $cmd"
+                    }
+                    addLog("WARN", tag, friendlyMsg)
+                }
+            }
+        }
+
+        val failCount = results.count { it.isFailure }
+        if (failCount > 0) {
+            addLog("DEBUG", tag, "Perintah: ${results.size - failCount} OK, $failCount gagal")
+        }
+        return results
+    }
+
+    /**
+     * Check if the scaling_governor is writable on this device.
+     * Returns false if SELinux or kernel blocks writes.
+     */
+    private suspend fun isGovernorWritable(): Boolean {
+        val testPath = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+        val result = ShizukuExecutor.runCommand("[ -w \"$testPath\" ] && echo writable || echo readonly")
+        return result.getOrNull()?.trim() == "writable"
+    }
+
+    private fun trySettingsApiFallback(cmd: String): Boolean {
+        val regex = """^settings\s+(put)\s+(system|global|secure)\s+(\S+)\s+(\S+)$""".toRegex()
+        val matchResult = regex.find(cmd.trim()) ?: return false
+        val (_, scope, key, rawValue) = matchResult.groupValues
+
+        return try {
+            when (scope) {
+                "system" -> {
+                    val intValue = rawValue.toIntOrNull()
+                    if (intValue != null)
+                        android.provider.Settings.System.putInt(context.contentResolver, key, intValue)
+                    else {
+                        val floatValue = rawValue.toFloatOrNull()
+                        if (floatValue != null)
+                            android.provider.Settings.System.putFloat(context.contentResolver, key, floatValue)
+                        else android.provider.Settings.System.putString(context.contentResolver, key, rawValue)
+                    }
+                }
+                "global" -> {
+                    val intValue = rawValue.toIntOrNull()
+                    if (intValue != null)
+                        android.provider.Settings.Global.putInt(context.contentResolver, key, intValue)
+                    else android.provider.Settings.Global.putString(context.contentResolver, key, rawValue)
+                }
+                "secure" -> {
+                    val intValue = rawValue.toIntOrNull()
+                    if (intValue != null)
+                        android.provider.Settings.Secure.putInt(context.contentResolver, key, intValue)
+                    else android.provider.Settings.Secure.putString(context.contentResolver, key, rawValue)
+                }
+                else -> return false
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Variante de [trySettingsApiFallback] que devuelve un [ExecOutcome]
+     * en lugar de Boolean. F1-CP1: expone el resultado del fallback in-process.
+     *
+     * Un settings put in-process es exit 0 sin shell; NO hay stderr ni exit code.
+     * Se clasifica como EXECUTED (efecto no verificado aún — CP4 añade read-back).
+     * Si el write lanza excepción → null (no aplicado, caller maneja).
+     */
+    private fun trySettingsApiOutcome(cmd: String): ExecOutcome? {
+        val regex = """^settings\s+(put)\s+(system|global|secure)\s+(\S+)\s+(\S+)$""".toRegex()
+        val matchResult = regex.find(cmd.trim()) ?: return null
+        val (_, scope, key, rawValue) = matchResult.groupValues
+
+        return try {
+            when (scope) {
+                "system" -> {
+                    val intValue = rawValue.toIntOrNull()
+                    if (intValue != null)
+                        android.provider.Settings.System.putInt(context.contentResolver, key, intValue)
+                    else {
+                        val floatValue = rawValue.toFloatOrNull()
+                        if (floatValue != null)
+                            android.provider.Settings.System.putFloat(context.contentResolver, key, floatValue)
+                        else android.provider.Settings.System.putString(context.contentResolver, key, rawValue)
+                    }
+                }
+                "global" -> {
+                    val intValue = rawValue.toIntOrNull()
+                    if (intValue != null)
+                        android.provider.Settings.Global.putInt(context.contentResolver, key, intValue)
+                    else android.provider.Settings.Global.putString(context.contentResolver, key, rawValue)
+                }
+                "secure" -> {
+                    val intValue = rawValue.toIntOrNull()
+                    if (intValue != null)
+                        android.provider.Settings.Secure.putInt(context.contentResolver, key, intValue)
+                    else android.provider.Settings.Secure.putString(context.contentResolver, key, rawValue)
+                }
+                else -> return null
+            }
+            // Settings API write succeeded in-process (no shell) — exit 0 equivalente
+            ExecOutcome.EXECUTED("settings-api-fallback")
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ─── Logging ──────────────────────────────────────────────────
+
+    fun addLog(level: String, tag: String, message: String) {
+        val timestamp = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+            .format(java.util.Date())
+        scope.launch {
+            logDao.insertLog(LogEntity(timestamp = timestamp, level = level, tag = tag, message = message.stripEmoji()))
+            Log.d(tag, "[$level] $message")
+        }
+    }
+
+    fun logAsync(level: String, tag: String, message: String) = addLog(level, tag, message)
+
+    // ─── Shell sanitizer ─────────────────────────────────────────
+
+    fun sanitizeShellArg(input: String): String {
+        return input.filter { c ->
+            c.isLetterOrDigit() || c == '.' || c == '-' || c == '_' || c == '/'
+        }
+    }
+
+    // ─── Shutdown ─────────────────────────────────────────────────
+
+    fun shutdown() {
+        hysteresisJob.getAndSet(null)?.cancel()
+        scope.cancel()
+        Log.d(TAG, "GameSessionManager detenido")
+    }
+}
